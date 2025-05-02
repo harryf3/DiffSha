@@ -50,24 +50,6 @@ def construct_message_tensor(mess):
 # this seems like a relatively safe number but have to test with multiple hashes 
 # Could possibly be a little smaller
 
-def coerce(tens):
-    # In order to simulate the bernoulli sample we use this steep sigmoid
-    # Steepness to ensure that the entire range of function occours between 0 and 1
-    #return torch.sigmoid(8.0*(tens-0.5))
-    # # While this works on inference and in theory in practice the gradients are way too small even at 1st round
-    return tens
-
-def force_coerce(tens,steepness):
-    return (torch.tanh(steepness*(tens-0.5 + torch.randn((1))))+1.0)/2.0
-
-def relax_coerce(logits, temperature=0.1):
-    # Relaxed bernoulli sampling
-    # Also introduces some stochasticity 
-    u = torch.rand_like(logits)
-    gumbel = -torch.log(-torch.log(u + 1e-10) + 1e-10)
-    
-    return torch.sigmoid((logits + gumbel) / temperature)
-
 def right_rotate(tens, by):
     # Doesn't need to be coerced
     return torch.roll(tens,by)
@@ -76,17 +58,23 @@ def bitnot(tens):
     #return (tens-1)**2 # maybe problem since assumes p*p so now chance is less likely where as abs would make chance
     # Doesn't need to be coerced
     #return torch.abs(tens-1.0)
-    return 1.0 - tens
+    return torch.abs(1.0 - tens)
     #return 5.30817622906 * torch.log(torch.cosh(tens-1.0)) # 5.3081 ... is the multiplier that lets bitnot(0) = 1 instead of 1/5.30....
+
+def bitand(a,b):
+    # This offers a alternative so we don't have so many mults of vals in backward pass 
+    # maybe even torch.log((a+b+2 - torch.abs(a-b))/2.0)
+    return a*b
+    #return a*b
 
 def bitwise_add(a, b):
     # This is probably what is causing big big grads and slowness 
     # Kind of stuck with it I suppose you could go to number than back 
     for _ in range(32):
-        carry = left_shift((a*b),1)
+        carry = left_shift(bitand(a,b),1)
         a = xor(a,b)
         b = carry
-    return coerce(a)
+    return a
 
 def bitwise_adds(lis):
     # Doesn't need to be coerced since bitwise_add is 
@@ -111,7 +99,7 @@ def left_shift(tens,by):
 
 def xor(tens1,tens2):
     # Must be coerced 
-    return coerce((tens1 + tens2) - 2*tens1*tens2)
+    return (tens1 + tens2) - 2*bitand(tens1,tens2)
 
 def sigma0(tens):
     # Interesting to note bit probs post op are ~ gaussian
@@ -127,10 +115,10 @@ def capsigma1(tens):
     return xor(xor(right_rotate(tens, 6),right_rotate(tens, 11)),right_rotate(tens, 25))
 
 def ch(tens1, tens2, tens3):
-    return xor(coerce(tens1*tens2),coerce(bitnot(tens1) * tens3))
+    return xor(bitand(tens1,tens2), bitand(bitnot(tens1),tens3))
 
 def maj(tens1, tens2, tens3):
-    return xor(xor(coerce(tens1 * tens2), coerce(tens1 * tens3)),coerce(tens2 * tens3))
+    return xor(xor( bitand(tens1,tens2), bitand(tens1,tens3)), bitand(tens2,tens3))
 
 class DiffSha:
     def __init__(self):
@@ -168,12 +156,8 @@ class DiffSha:
         self.th6 = bytes_to_bits(self.h6.to_bytes(4,"big"))
         self.th7 = bytes_to_bits(self.h7.to_bytes(4,"big"))
 
-    def do_hash(self,message,rounds=64,force=False,relax=False,steepness=3.5,temperature=0.1):
-        if(force):
-            message = force_coerce(message,steepness)
-        if(relax):
-            message = relax_coerce(message,temperature)
-        print(message)
+    def do_hash(self,message,rounds=64):
+        #print(message)
         message_schedule = []
 
         th0 = bytes_to_bits(self.h0.to_bytes(4,"big"))
@@ -197,9 +181,19 @@ class DiffSha:
                 term3 = sigma0(message_schedule[t-15])
                 term4 = message_schedule[t-16]
 
+                print(f"Round {t}")
+                print(f"T1 {term1}")
+                print(f"T2 {term2}")
+                print(f"T3 {term3}")
+                print(f"T4 {term4}")
+
                 # append a 4-byte byte object
                 schedule = bitwise_adds([term1, term2, term3, term4])# We work in bits no need to modulo 32 
+                print(f"Schedule {schedule}")
+                print("#"*50)
                 message_schedule.append(schedule)
+
+        #print(message_schedule)
 
         a = th0
         b = th1
@@ -252,3 +246,16 @@ class DiffSha:
         return out
         #out = F.sigmoid(out-1.0)
 
+if __name__ == "__main__":
+    from hashlib import sha256
+    og_string = "balls"
+    og_hash = sha256(og_string.encode("utf-8")).digest()
+    og_hash_tensor = bytes_to_bits(og_hash)
+
+    message,message_len = construct_message_tensor(og_string)
+    og_message = message.clone().detach()
+    #message.requires_grad = True
+
+    ds = DiffSha()
+
+    ds.do_hash(message-0.1)
